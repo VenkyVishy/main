@@ -673,7 +673,7 @@ def load_existing_playlist_channels():
                 line = line.strip()
                 if line.startswith("http"):
                     WRITTEN_CHANNELS.add(line)
-    log.info("Intialized WRITTEN_CHANNELS with %d existing URLs", len(WRITTEN_CHANNELS))
+    log.info("Initialized WRITTEN_CHANNELS with %d existing URLs", len(WRITTEN_CHANNELS))
 
 # ---------------- MAIN WORKFLOW ----------------
 def perform_discovery_and_validation(conn):
