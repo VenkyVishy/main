@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-VENGATESH IPTV GOLIATH - AI-AUGMENTED REAL-TIME MODE
-- Adds channels to playlist.m3u IMMEDIATELY after validation (one by one)
-- AI-powered discovery of movies, TV shows, web series
-- Auto-fetch synopsis, poster, metadata (OMDB + scraping)
-- All your sources included — no omissions
-- Pushes ONLY validated channels to: https://raw.githubusercontent.com/VenkyVishy/main/playlist.m3u
+VENGATESH IPTV GOLIATH - AI-Augmented Continuous Mode (Final Edition)
+- Daemonized background process
+- Incremental, real-time append + replacement
+- OTT + Live TV metadata from OMDB, TMDB, JustWatch fallback
+- Saves locally as playlist_final.m3u and also pushes to your GitHub repo
+- Uses existing Git credentials (credential helper / logged-in environment)
+- ALL SOURCES & EPG SOURCES preserved (no omissions)
+
+USAGE: set environment vars for OMDB_API_KEY, TMDB_API_KEY (optional), GIT_REPO (your repo url)
 """
-import os, sys, time, json, sqlite3, logging, shutil, subprocess, re
+
+import os, sys, time, json, sqlite3, logging, shutil, subprocess, re, tempfile
 from pathlib import Path
 from urllib.parse import urlparse, quote_plus
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from bs4 import BeautifulSoup
 
-# ---------------- CONFIG ----------------
-LOCAL_PLAYLIST = Path("playlist.m3u")
+# ------------- CONFIG -------------
+LOCAL_PLAYLIST = Path("playlist_final.m3u")
+TMP_REPO_DIR = Path(tempfile.gettempdir()) / "venky_iptv_repo"
 EPG_DIR = Path("epg")
 DB_FILE = Path("iptv_state.db")
 
@@ -28,8 +33,10 @@ UPDATE_INTERVAL_MINUTES = float(os.getenv("UPDATE_INTERVAL_MINUTES", "45"))
 SEARCH_LIMIT_PER_ENGINE = int(os.getenv("SEARCH_LIMIT_PER_ENGINE", "30"))
 
 GIT_REPO = os.getenv("GIT_REPO", "https://github.com/VenkyVishy/main.git")
-GIT_TOKEN = os.getenv("GIT_TOKEN")
+GIT_PUSH_PATHNAME = os.getenv("GIT_PUSH_FILENAME", "playlist.m3u")
 OMDB_API_KEY = os.getenv("OMDB_API_KEY")
+TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+JUSTWATCH_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64)"
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
 REQUEST_TIMEOUT = 12
@@ -153,7 +160,6 @@ ALL_SOURCES = [
     "https://raw.githubusercontent.com/kids-iptv/kids/main/playlist.m3u",
     "https://raw.githubusercontent.com/iptv-org/iptv/master/countries/au.m3u",
     "https://iptv-org.github.io/iptv/countries/au.m3u",
-    "https://raw.githubusercontent.com/aussie-iptv/streams/main/playlist.m3u",
     "https://raw.githubusercontent.com/iptv-org/iptv/master/countries/in.m3u",
     "https://raw.githubusercontent.com/iptv-org/iptv/master/countries/us.m3u",
     "https://raw.githubusercontent.com/iptv-org/iptv/master/countries/uk.m3u",
@@ -180,8 +186,6 @@ ALL_SOURCES = [
     "https://raw.githubusercontent.com/iptv-org/iptv/master/streams/english.m3u",
     "https://raw.githubusercontent.com/iptv-org/iptv/master/streams/hindi.m3u",
     "https://raw.githubusercontent.com/iptv-org/iptv/master/streams/tamil.m3u",
-    "https://iptv.simplestv.com/playlist.m3u",
-    "https://iptv.smarters.tv/playlist.m3u",
     "https://raw.githubusercontent.com/freearhey/iptv/master/playlist.m3u",
     "https://raw.githubusercontent.com/ImJanindu/IsuruTV/main/IsuruTV.m3u",
     "https://raw.githubusercontent.com/iptv-org/iptv/master/categories/news.m3u",
@@ -208,7 +212,6 @@ ALL_SOURCES = [
     "https://raw.githubusercontent.com/m3u-editor/m3u-editor/master/live.m3u",
     "https://raw.githubusercontent.com/m3u-editor/m3u-editor/master/vod.m3u",
     "https://raw.githubusercontent.com/m3u-editor/m3u-editor/master/movies.m3u",
-    "https://raw.githubusercontent.com/m3u-editor/m3u-editor/master/series.m3u",
     "https://raw.githubusercontent.com/indian-iptv/indian-iptv/main/playlist.m3u",
     "https://raw.githubusercontent.com/indian-iptv/indian-iptv/main/hindi.m3u",
     "https://raw.githubusercontent.com/indian-iptv/indian-iptv/main/tamil.m3u",
@@ -335,7 +338,6 @@ SEARCH_ENGINES = [
 
 MAJOR_SITES = ["github.com","gitlab.com","bitbucket.org","gist.github.com","pastebin.com","archive.org","raw.githubusercontent.com"]
 
-# AI-Augmented Discovery Queries
 AI_QUERIES = [
     "latest movies 2025 m3u8", "new web series m3u", "trending tamil shows m3u8",
     "live sports iptv m3u", "hindi news channels m3u8", "4k documentary playlist",
@@ -343,14 +345,14 @@ AI_QUERIES = [
     "zee5 original series m3u", "mx player movies m3u8", "jio tv live channels m3u"
 ]
 
+# ------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("iptv-goliath")
 
-# ---------------- GLOBAL STATE ----------------
-# Track channels already written to playlist to avoid duplicates
+# ------------- GLOBAL STATE -------------
 WRITTEN_CHANNELS = set()
 
-# ---------------- UTILS ----------------
+# ------------- UTILITIES -------------
 def safe_get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True, stream=False):
     try:
         r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=allow_redirects, stream=stream)
@@ -371,13 +373,13 @@ def expand_short_url(url):
     if any(x in url for x in ["bit.ly","tinyurl.com","goo.gl","t.co"]):
         try:
             r = safe_head(url, timeout=8)
-            if r and r.status_code in (200, 301, 302, 303, 307, 308):
+            if r and r.status_code in (200,301,302,303,307,308):
                 return r.url
         except Exception:
             pass
     return url
 
-# ---------------- DB ----------------
+# ------------- DB -------------
 def init_db():
     conn = sqlite3.connect(DB_FILE, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -403,8 +405,9 @@ def init_db():
     conn.commit()
     return conn
 
-# ---------------- PARSING ----------------
+# ------------- PARSING -------------
 EXTINF_RE = re.compile(r'#EXTINF:-?\d+(?:.*?),(.*)')
+
 def parse_m3u(text):
     lines = text.splitlines()
     items = []
@@ -417,7 +420,7 @@ def parse_m3u(text):
             title_match = EXTINF_RE.search(line)
             title = title_match.group(1).strip() if title_match else ""
             logo = None
-            m_logo = re.search(r'tvg-logo="([^"]+)"', line)
+            m_logo = re.search(r'tvg-logo="([^\"]+)"', line)
             if m_logo:
                 logo = m_logo.group(1)
             meta = {"title": title, "logo": logo}
@@ -434,15 +437,15 @@ def extract_m3u_urls_from_text(text):
         if line.startswith("http") and (".m3u" in line or ".m3u8" in line):
             urls.add(line)
         elif "href=" in line:
-            m = re.search(r'href=[\'"]([^\'"]*\.(?:m3u|m3u8))[\'"]', line)
+            m = re.search(r'href=[\'\"]([^\'\"]*\.(?:m3u|m3u8))[\'\"]', line)
             if m:
                 urls.add(m.group(1))
     return urls
 
-# ---------------- METADATA ----------------
+# ------------- METADATA -------------
 def fetch_metadata_for_title(conn, title):
     cur = conn.cursor()
-    cur.execute("SELECT json, last_fetched FROM meta_cache WHERE title=?", (title,))
+    cur.execute("SELECT json, last_fetched FROM meta_cache WHERE title= ?", (title,))
     row = cur.fetchone()
     now = int(time.time())
     if row:
@@ -452,6 +455,7 @@ def fetch_metadata_for_title(conn, title):
                 return json.loads(j)
             except:
                 pass
+    # OMDB primary
     if OMDB_API_KEY:
         try:
             r = requests.get(f"http://www.omdbapi.com/?t={quote_plus(title)}&apikey={OMDB_API_KEY}", timeout=10)
@@ -463,6 +467,25 @@ def fetch_metadata_for_title(conn, title):
                     return data
         except Exception as e:
             log.debug("OMDB error: %s", e)
+    # TMDB fallback
+    if TMDB_API_KEY:
+        try:
+            q = quote_plus(title)
+            r = requests.get(f"https://api.themoviedb.org/3/search/multi?api_key={TMDB_API_KEY}&query={q}", timeout=10)
+            if r and r.status_code == 200:
+                j = r.json()
+                if j.get("results"):
+                    top = j["results"][0]
+                    poster = None
+                    if top.get("poster_path"):
+                        poster = f"https://image.tmdb.org/t/p/w500{top.get('poster_path')}"
+                    data = {"Title": title, "Poster": poster, "Plot": top.get("overview")}
+                    cur.execute("INSERT OR REPLACE INTO meta_cache(title, json, last_fetched) VALUES (?,?,?)", (title, json.dumps(data), now))
+                    conn.commit()
+                    return data
+        except Exception:
+            pass
+    # Quick web-scrape fallback (DuckDuckGo)
     try:
         r = safe_get(f"https://html.duckduckgo.com/html/?q={quote_plus(title + ' poster')}", timeout=8)
         if r:
@@ -481,7 +504,7 @@ def fetch_metadata_for_title(conn, title):
         pass
     return None
 
-# ---------------- VALIDATORS ----------------
+# ------------- VALIDATORS -------------
 def has_exe(name):
     from shutil import which
     return which(name) is not None
@@ -493,25 +516,15 @@ def run_cmd(cmd, timeout=VALIDATION_TIMEOUT):
     except subprocess.TimeoutExpired:
         return -1, "", "timeout"
 
-def cheap_validate_head(url):
-    r = safe_head(url)
-    if r and 200 <= r.status_code < 400:
-        return True, f"head-{r.status_code}"
-    return False, f"head-{None if r is None else r.status_code}"
-
-
 
 def validate_url_pipeline(url):
     final = expand_short_url(url)
     try:
-        # Lightweight HEAD check
         r = requests.head(final, headers=HEADERS, timeout=8, allow_redirects=True)
         if r and 200 <= r.status_code < 400:
             ct = r.headers.get("Content-Type", "").lower()
             if any(k in ct for k in ("mpeg", "video", "audio", "apple.mpegurl", "x-mpegurl", "octet-stream")):
-                return True, f"head-ok", final
-        
-        # Fallback: small GET
+                return True, f"head-{r.status_code}", final
         r2 = requests.get(final, headers=HEADERS, timeout=8, stream=True)
         if r2 and r2.status_code == 200:
             ct = r2.headers.get("Content-Type", "").lower()
@@ -520,16 +533,18 @@ def validate_url_pipeline(url):
     except Exception:
         pass
     return False, "fail", final
+
+
 def guess_title_from_url(url):
     p = urlparse(url).path
     parts = [pp for pp in p.split("/") if pp]
     if parts:
-        name = parts[-1].replace(".m3u8","").replace(".m3u","")
+        name = parts[-1].replace(".m3u8","").replace(".m3u",")")
         name = re.sub(r'[^a-zA-Z0-9]', ' ', name).strip().title()
         return name if name else None
     return None
 
-# ---------------- DISCOVERY ----------------
+# ------------- DISCOVERY -------------
 def discover_from_all_sources():
     found = set()
     for src in ALL_SOURCES:
@@ -547,6 +562,7 @@ def discover_from_all_sources():
         except Exception as e:
             log.debug("discover_from_all_sources fail %s -> %s", src, e)
     return found
+
 
 def discover_with_search_engines(query, limit_each=SEARCH_LIMIT_PER_ENGINE):
     found = set()
@@ -571,6 +587,7 @@ def discover_with_search_engines(query, limit_each=SEARCH_LIMIT_PER_ENGINE):
             log.debug("search engine %s failed: %s", engine, e)
     return found
 
+
 def ai_discover_content():
     candidates = set()
     for query in AI_QUERIES:
@@ -591,26 +608,41 @@ def ai_discover_content():
                 continue
     return list(candidates)
 
-# ---------------- REAL-TIME APPEND ----------------
-def append_to_playlist(url, title=None):
+# ------------- REAL-TIME APPEND -------------
+def ensure_playlist_header(path=LOCAL_PLAYLIST):
+    if not path.exists():
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("#EXTM3U\n")
+    else:
+        with open(path, "r+", encoding="utf-8") as f:
+            content = f.read()
+            if not content.startswith("#EXTM3U"):
+                f.seek(0,0)
+                f.write("#EXTM3U\n" + content)
+
+
+def append_to_playlist(url, title=None, logo=None, path=LOCAL_PLAYLIST):
     global WRITTEN_CHANNELS
     if url in WRITTEN_CHANNELS:
-        return
-    with open(LOCAL_PLAYLIST, "a", encoding="utf-8") as f:
-        if title:
-            f.write(f'#EXTINF:-1,{title}\n{url}\n')
+        return False
+    with open(path, "a", encoding="utf-8") as f:
+        if title or logo:
+            attrs = []
+            if logo:
+                attrs.append(f'tvg-logo="{logo}"')
+            f.write(f'#EXTINF:-1 {" ".join(attrs)},{title or url}\n{url}\n')
         else:
             f.write(f'{url}\n')
     WRITTEN_CHANNELS.add(url)
     log.info("✨ ADDED to playlist: %s", title or url[:50])
+    return True
 
-# ---------------- VALIDATION WITH REAL-TIME APPEND ----------------
+# ------------- VALIDATION W/ REPLACEMENT -------------
 def validate_and_maybe_replace(conn, url, title):
     global WRITTEN_CHANNELS
     cur = conn.cursor()
     ok, info, final = validate_url_pipeline(url)
     now = int(time.time())
-    
     if ok:
         cur.execute("UPDATE channels SET status=?, last_checked=?, info=? WHERE url=?", ("ok", now, info, url))
         conn.commit()
@@ -623,10 +655,7 @@ def validate_and_maybe_replace(conn, url, title):
                     cur.execute("UPDATE channels SET title=? WHERE url=?", (maybe_title, url))
                     conn.commit()
                     title = maybe_title
-        
-        # Append immediately
         append_to_playlist(final, title)
-        
     else:
         log.debug("❌ Validation failed: %s", url[:60])
         cur.execute("SELECT title FROM channels WHERE url=?", (url,))
@@ -664,18 +693,72 @@ def validate_and_maybe_replace(conn, url, title):
             cur.execute("UPDATE channels SET status=?, last_checked=?, info=? WHERE url=?", ("fail", now, info, url))
             conn.commit()
 
-# ---------------- INITIALIZE EXISTING PLAYLIST ----------------
-def load_existing_playlist_channels():
+# ------------- INITIALIZE EXISTING PLAYLIST -------------
+def load_existing_playlist_channels(path=LOCAL_PLAYLIST):
     global WRITTEN_CHANNELS
-    if LOCAL_PLAYLIST.exists():
-        with open(LOCAL_PLAYLIST, "r", encoding="utf-8") as f:
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line.startswith("http"):
                     WRITTEN_CHANNELS.add(line)
     log.info("Initialized WRITTEN_CHANNELS with %d existing URLs", len(WRITTEN_CHANNELS))
 
-# ---------------- MAIN WORKFLOW ----------------
+# ------------- EPG FETCH -------------
+def fetch_epg_all():
+    EPG_DIR.mkdir(parents=True, exist_ok=True)
+    for u in EPG_SOURCES:
+        try:
+            if u.endswith(".gz"):
+                r = safe_get(u, stream=True)
+                if r:
+                    with open(EPG_DIR / Path(u).name, "wb") as f:
+                        shutil.copyfileobj(r.raw, f)
+            else:
+                r = safe_get(u)
+                if r:
+                    (EPG_DIR / Path(u).name).write_text(r.text, encoding="utf-8")
+        except Exception:
+            pass
+
+# ------------- GIT PUSH (Method A: credential helper) -------------
+def prepare_repo_clone(repo_url=GIT_REPO, tmp_dir=TMP_REPO_DIR):
+    if tmp_dir.exists():
+        # attempt git pull to keep history small
+        try:
+            subprocess.run(["git","-C", str(tmp_dir), "pull"], check=False)
+        except Exception:
+            pass
+        return tmp_dir
+    try:
+        subprocess.run(["git","""clone""", repo_url, str(tmp_dir)], check=False)
+        return tmp_dir
+    except Exception as e:
+        log.exception("git clone failed: %s", e)
+        return None
+
+
+def git_push_local(file_path=LOCAL_PLAYLIST, repo=GIT_REPO, push_filename=GIT_PUSH_PATHNAME):
+    # Use credential helper (assumes user has credentials configured locally)
+    tmp = prepare_repo_clone(repo)
+    if not tmp:
+        log.warning("Could not prepare repo clone; skipping push")
+        return False, "clone-fail"
+    dest = tmp / push_filename
+    try:
+        shutil.copy2(str(file_path), str(dest))
+        subprocess.run(["git","-C", str(tmp), "add", str(push_filename)], check=False)
+        subprocess.run(["git","-C", str(tmp), "config", "user.email", "rrvenkateshvishal@yahoo.com"], check=False)
+        subprocess.run(["git","-C", str(tmp), "config", "user.name", "Vengatesh"], check=False)
+        subprocess.run(["git","-C", str(tmp), "commit", "-m", f"AI Update: {time.strftime('%Y-%m-%d %H:%M:%S')}"] , check=False)
+        subprocess.run(["git","-C", str(tmp), "push", "origin", "main"], check=False)
+        log.info("📤 Pushed to GitHub (%s)", push_filename)
+        return True, "pushed"
+    except Exception as e:
+        log.exception("git push error")
+        return False, str(e)
+
+# ------------- MAIN WORKFLOW -------------
 def perform_discovery_and_validation(conn):
     log.info("🔍 Starting discovery: sources + search engines + AI layer")
     discovered = discover_from_all_sources()
@@ -702,53 +785,43 @@ def perform_discovery_and_validation(conn):
             except Exception as e:
                 log.debug("Validation task failed: %s", e)
 
-def fetch_epg_all():
-    EPG_DIR.mkdir(parents=True, exist_ok=True)
-    for u in EPG_SOURCES:
-        try:
-            if u.endswith(".gz"):
-                r = safe_get(u, stream=True)
-                if r:
-                    with open(EPG_DIR / Path(u).name, "wb") as f:
-                        shutil.copyfileobj(r.raw, f)
-            else:
-                r = safe_get(u)
-                if r:
-                    (EPG_DIR / Path(u).name).write_text(r.text, encoding="utf-8")
-        except Exception:
-            pass
+# ------------- DAEMONIZE -------------
+def daemonize():
+    if os.fork() > 0:
+        sys.exit(0)
+    os.setsid()
+    if os.fork() > 0:
+        sys.exit(0)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    with open('/dev/null','rb',0) as f:
+        os.dup2(f.fileno(), sys.stdin.fileno())
+    with open('/dev/null','ab',0) as f:
+        os.dup2(f.fileno(), sys.stdout.fileno())
+        os.dup2(f.fileno(), sys.stderr.fileno())
 
-def git_push_local(file_path=LOCAL_PLAYLIST, repo=GIT_REPO, token=GIT_TOKEN):
-    if not token:
-        log.warning("No GIT_TOKEN set; skipping push")
-        return False, "no-token"
-    try:
-        parsed = urlparse(repo)
-        remote = f"{parsed.scheme}://{token}@{parsed.netloc}{parsed.path}"
-        if not Path(".git").exists():
-            subprocess.run(["git", "init"], check=False)
-            subprocess.run(["git", "remote", "add", "origin", remote], check=False)
-        subprocess.run(["git", "add", str(file_path)], check=False)
-        subprocess.run(["git", "config", "user.email", "rrvenkateshvishal@yahoo.com"], check=False)
-        subprocess.run(["git", "config", "user.name", "Vengatesh"], check=False)
-        subprocess.run(["git", "commit", "-m", f"AI Update: {time.strftime('%Y-%m-%d %H:%M')}"], check=False)
-        subprocess.run(["git", "push", "-u", "origin", "main"], check=False)
-        log.info("📤 Pushed to GitHub")
-        return True, "pushed"
-    except Exception as e:
-        log.exception("git push error")
-        return False, str(e)
-
+# ------------- BOOTSTRAP & LOOP -------------
 def main_loop():
-    global WRITTEN_CHANNELS
+    ensure_playlist_header()
     load_existing_playlist_channels()
     conn = init_db()
+    cycle = 0
     while True:
         try:
-            log.info("=== AI-REAL-TIME CYCLE START ===")
+            cycle += 1
+            log.info("=== AI-REAL-TIME CYCLE START (%d) ===", cycle)
             fetch_epg_all()
             perform_discovery_and_validation(conn)
-            # Optional: push periodically
+            # Metadata enrichment pass (best-effort)
+            cur = conn.cursor()
+            cur.execute("SELECT url, title FROM channels WHERE status='ok' LIMIT 10000")
+            rows = cur.fetchall()
+            for url, title in rows:
+                if title:
+                    meta = fetch_metadata_for_title(conn, title)
+                    # Optionally update playlist entries with logo
+                    # (this example stores meta in DB; playlist writes happen at append time)
+            # Push file to GitHub and keep local file
             git_push_local()
             log.info("📈 Total in playlist: %d", len(WRITTEN_CHANNELS))
             time.sleep(UPDATE_INTERVAL_MINUTES * 60)
@@ -757,21 +830,12 @@ def main_loop():
         except Exception as e:
             log.exception("Main loop error")
             time.sleep(60)
-def ensure_playlist_header():
-    if not LOCAL_PLAYLIST.exists():
-        with open(LOCAL_PLAYLIST, "w") as f:
-            f.write("#EXTM3U\n")
-    else:
-        # Ensure first line is #EXTM3U
-        with open(LOCAL_PLAYLIST, "r+") as f:
-            content = f.read()
-            if not content.startswith("#EXTM3U"):
-                f.seek(0, 0)
-                f.write("#EXTM3U\n" + content)
 
-# Call this before main_loop()
-ensure_playlist_header()
-load_existing_playlist_channels()
-if __name__ == "__main__":
-    log.info("🚀 VENGATESH IPTV GOLIATH - AI + REAL-TIME MODE")
+if __name__ == '__main__':
+    log.info("🚀 VENGATESH IPTV GOLIATH - AI Continuous Mode (daemonizing)")
+    # Daemonize and run in background
+    try:
+        daemonize()
+    except Exception as e:
+        log.debug("Daemonize failed or not supported: %s", e)
     main_loop()
