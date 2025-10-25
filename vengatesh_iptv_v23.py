@@ -39,7 +39,7 @@ CHANNEL_THRESHOLD = int(os.getenv("CHANNEL_THRESHOLD", "90000"))
 REVALIDATION_DAYS = int(os.getenv("REVALIDATION_DAYS", "7"))
 WORKER_COUNT = int(os.getenv("WORKER_COUNT", "8"))
 VALIDATION_TIMEOUT = int(os.getenv("VALIDATION_TIMEOUT", "20"))
-UPDATE_INTERVAL_MINUTES = float(os.getenv("UPDATE_INTERVAL_MINUTES", "45"))
+UPDATE_INTERVAL_MINUTES = float(os.getenv("UPDATE_INTERVAL_MINUTES", "3"))
 SEARCH_LIMIT_PER_ENGINE = int(os.getenv("SEARCH_LIMIT_PER_ENGINE", "30"))
 
 OMDB_API_KEY = os.getenv("OMDB_API_KEY")
@@ -1020,6 +1020,122 @@ if __name__ == "__main__":
         master_playlist = silent_replace_broken(master_playlist, global_list)
 
     print("[✔] Validation & silent replacement completed.")
+# ────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────
+# --- M3U URL + VALIDATION + METADATA + SILENT REPLACEMENT EXTENSION ---
+# ────────────────────────────────────────────────────────────────
+
+import requests, time, random
+
+GLOBAL_PLAYLIST_URL = ALL_SOURCES
+print(f"\n[+] Global M3U Source: {ALL_SOURCES}\n")
+print(f"\n[+] Global M3U Source: {SEARCH_ENGINES}\n")
+
+
+def validate_channel(url: str, retries: int = 2) -> bool:
+    """Check if a channel URL is reachable (HTTP 200) with retry support."""
+    for attempt in range(retries):
+        try:
+            r = requests.head(url, timeout=5)
+            if r.status_code == 200:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.8)   
+        return False
+
+def fetch_global_playlist() -> list:
+    """Fetch and parse the remote M3U playlist into a list of channel entries."""
+    try:
+        data = requests.get(GLOBAL_PLAYLIST_URL, timeout=10).text
+        entries = []
+        current = {}
+        for line in data.splitlines():
+            if line.startswith("#EXTINF"):
+                current["info"] = line
+            elif line.startswith("http"):
+                current["url"] = line.strip()
+                entries.append(current)
+                current = {}
+        print(f"[i] Found {len(entries)} entries from global playlist.")
+        return entries
+    except Exception as e:
+        print("[!] Failed to fetch global playlist:", e)
+        return []
+
+def enrich_with_metadata(entry: dict) -> dict:
+    """Optional metadata & EPG enrichment."""
+    try:
+        title = entry.get("info", "").split(",")[-1].strip()
+        if title:
+            q = requests.get(f"https://www.omdbapi.com/?t={title}&apikey=4a3b711b", timeout=6)
+            if q.status_code == 200:
+                data = q.json()
+                if data.get("Poster") and data.get("Response") == "True":
+                    entry["metadata"] = {
+                        "Title": data.get("Title"),
+                        "Year": data.get("Year"),
+                        "Genre": data.get("Genre"),
+                        "Poster": data.get("Poster"),
+                        "Plot": data.get("Plot")
+                    }
+    except Exception:
+        pass
+    return entry
+
+def add_validated_channels(master_playlist: list, global_entries: list):
+    """Add new channels only after validation."""
+    added, skipped = 0, 0
+    for ch in global_entries:
+        url = ch.get("url")
+        if not url:
+            continue
+        if validate_channel(url):
+            enriched = enrich_with_metadata(ch)
+            master_playlist.append(enriched)
+            added += 1
+            print(f"[✓] Added: {url}")
+        else:
+            skipped += 1
+            print(f"[×] Skipped (unreachable): {url}")
+        time.sleep(random.uniform(0.3, 1.2))
+    print(f"[✔] Added {added} new channels. Skipped {skipped}.")
+    return master_playlist
+
+def silent_replace_broken(master_playlist: list, global_entries: list):
+    """Silently replace dead links with working ones from the global list."""
+    replaced = 0
+    for i, ch in enumerate(master_playlist):
+        url = ch.get("url")
+        if not validate_channel(url):
+            for g in global_entries:
+                g_url = g.get("url")
+                if validate_channel(g_url):
+                    master_playlist[i] = g
+                    replaced += 1
+                    print(f"[↻] Replaced broken link with: {g_url}")
+                    break
+    print(f"[✓] Silent replacements done: {replaced}")
+    return master_playlist
+
+# ── Initialization ──────────────────────────────────────────────
+if __name__ == "__main__":
+    print("[*] Fetching global playlist and validating channels...")
+    global_list = fetch_global_playlist()
+
+    # Ensure master_playlist exists
+    try:
+        master_playlist
+    except NameError:
+        master_playlist = []
+
+    # Add validated new channels
+    master_playlist = add_validated_channels(master_playlist, global_list)
+
+    # Silent replacements for broken channels
+    master_playlist = silent_replace_broken(master_playlist, global_list)
+
+    print("[✔] Validation & silent replacement completed successfully.")
 # ────────────────────────────────────────────────────────────────
 
 # ------------- Entry -------------
