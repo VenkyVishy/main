@@ -478,6 +478,7 @@ def ensure_playlist_header(path=LOCAL_PLAYLIST):
             if not content.startswith("#EXTM3U"):
                 f.seek(0, 0)
                 f.write("#EXTM3U\n" + content)
+               
 
 def append_to_playlist(url, title=None, logo=None, path=LOCAL_PLAYLIST):
     global WRITTEN_CHANNELS
