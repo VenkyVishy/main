@@ -32,7 +32,7 @@ from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 
 # --- CONFIG ---
-UPDATE_INTERVAL = 1800
+UPDATE_INTERVAL = 18
 FETCH_TIMEOUT = 8
 VALIDATE_TIMEOUT = 6
 MAX_CONCURRENT_FETCHES = 60
